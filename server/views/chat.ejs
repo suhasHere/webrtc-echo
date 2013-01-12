@@ -1,0 +1,76 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>WebRTC Expo 2012 - Keynote Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="A WebRTC Demo">
+    <meta name="author" content="Suhas Nandakumar">
+    <meta name="author" content="Cary Bran">
+    <link href="css/bootstrap.css" rel="stylesheet">
+  </head>
+
+  <body>
+    <div id="main" class="container">
+      <!-- TODO: Clean up bg-top box model -->
+      <div class="bg-top">
+        <!-- video data -->
+        <div id="videowindow" style="display:none">
+          <div class="row-fluid" id="media">
+            <div class="span12">
+              <video id="remotevideo" class="remote"  type='video/webm; codecs="vp8, vorbis"'  />
+              </video>
+              <video id="localvideo" class="local"  type='video/webm; codecs="vp8, vorbis"'/>
+              </video>
+             <audio id="remoteaudio"></audio>
+             <audio id="localaudio" muted></audio>
+             <button class="btn btn-larger btn-danger" type="button" style="width=80%;" onclick="endCall();">End Call</button>
+            </div>
+          </div><!-- video block -->
+        </div>
+        <div id="contentwindow" style="display:block">
+          <div class="row-fluid" id="content">
+            <div class="span6">
+              <div id="login-box1" style = "display:block;">
+                <h1>Welcome Back !</h1>
+                <h4><span class = "muted" id="user"><%= user %></span></h4>
+              </div>
+            </div><!--/span-->
+            <div class="span6">
+              <div id="contact-list" style ="display:block;">
+                <table class="table" id="contactlist">
+                <tbody>
+                </tbody>
+                </table>
+              </div>
+            </div>
+          </div> <!-- Content Block -->
+        </div> <!-- Content Window -->
+      </div> <!-- bg-top-->
+
+     <div class="modal" id="incomingCall" tabindex="-1" role="dialog"
+           aria-labelledby="incomingCall" aria-hidden="true">
+        <div class="modal-header">
+          <button type="button" class="close" data-dismiss="modal" aria-hidden="true">×</button>
+          <h3>Incoming Call</h3>
+        </div>
+        <div class="modal-body">
+          <img src="img/incoming.png"/> &nbsp; <img style="float:right;" id="incomingPic" src=""/>'<br/>
+          <p>&nbsp;</p>
+          <p>You have an incoming call from <span id="incomingUser"></span></p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" data-dismiss="modal" aria-hidden="true">Reject</button>
+          <button id="incomingAccept" class="btn btn-primary">Accept</button>
+        </div>
+      </div>
+
+    </div> <!-- container -->
+
+    <script src="js/jquery.js"></script>
+    <script src="js/bootstrap.js"></script>
+    <script src ="js/headset.js"></script>
+    <script src="js/plantronicschat.js"></script>
+  </body>
+</html>

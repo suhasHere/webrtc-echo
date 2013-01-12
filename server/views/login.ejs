@@ -1,0 +1,51 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>WebRTC Expo 2012 - Keynote Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Cool WebRTC Demo">
+    <meta name="author" content="Anant Narayanan">
+    <meta name="author" content="Cary Bran">
+    <meta name="author" content="Suhas Nandakumar">
+    <link href="css/bootstrap.css" rel="stylesheet">
+  </head>
+
+  <body>
+    <div class="container">
+      <!-- Clean up bg-top box model.. -->
+      <div class="bg-top">
+        <!-- Display Content with 2 grid layout -->
+        <div id="contentwindow" style="display:block">
+          <div class="row-fluid">
+            <div class="span6">
+              <img src="img/webrtc_circles_logo.png" alt="WebRTC" style = "display:block;height: 222px; width: 218px; padding-left: 35%;padding-top: 30%;"/>
+            </div><!--/span left-->
+            <div class="span6">
+              <div id="login-box" style ="display:none;">
+                <h1>Web<span class="muted">RTC</span></h1>
+                <p class="muted"> Simply Smarter Communications </p>
+                  <% if (!offline) { %>
+                    <a href="#" onclick="navigator.id.request();">
+                      <img src="img/sign-in.png"/>
+                      </a>
+                  <% } else { %>
+                  <div class="input-append">
+                    <input class="span4" id="username" type="text">
+                    <button class="btn" type="button"
+                    onclick="doLogin(document.getElementById('username').value);">Sign in</button>
+                  </div>
+                  <% } %>
+                </div>
+            </div> <!-- span right -->
+          </div> <!-- row-fluid -->
+         </div>
+      </div>
+    </div> <!-- Container -->
+    <script src="js/jquery.js"></script>
+    <script src="js/bootstrap.js"></script>
+    <script src="js/headset.js"></script>
+    <script src="js/login.js"></script>
+  </body>
+</html>
