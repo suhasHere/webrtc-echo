@@ -221,8 +221,6 @@ function initiateCall(user) {
           // Send offer to remote end.
           log("setLocalDescription, sending to remote");
           peerc = pc;
-          alert(offer);
-          alert(JSON.stringify(offer));
           jQuery.post(
             "offer", {
               to: user,

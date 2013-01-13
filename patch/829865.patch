@@ -1,0 +1,1520 @@
+# HG changeset patch
+# Parent 44dcffe8792b49ce4ef2e6471f61e1af5ff62b5e
+Bug 829865 Version 1 of RTCClient with Http messaging
+
+diff --git a/media/webrtc/signaling/test/Makefile.in b/media/webrtc/signaling/test/Makefile.in
+--- a/media/webrtc/signaling/test/Makefile.in
++++ b/media/webrtc/signaling/test/Makefile.in
+@@ -139,15 +139,16 @@ ifneq ($(OS_TARGET),WINNT)
+ ifdef JS_SHARED_LIBRARY
+ LIBS += $(MOZ_ZLIB_LIBS)
+ endif
+ 
+ CPP_UNIT_TESTS = \
+   signaling_unittests.cpp \
+   mediapipeline_unittest.cpp \
+   mediaconduit_unittests.cpp \
++  RTCApp.cpp \
+   $(NULL)
+ endif
+ 
+ include $(topsrcdir)/config/config.mk
+ include $(topsrcdir)/media/webrtc/webrtc-config.mk
+ include $(topsrcdir)/ipc/chromium/chromium-config.mk
+ include $(topsrcdir)/config/rules.mk
+diff --git a/media/webrtc/signaling/test/RTCApp.cpp b/media/webrtc/signaling/test/RTCApp.cpp
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/RTCApp.cpp
+@@ -0,0 +1,292 @@
++#ifndef __RTCAPP_IMPL_H
++#define __RTCAPP_IMPL_H
++
++#include "rtc_app.h"
++#include "nsThreadUtils.h"
++#include "ev_source_impl.h"
++
++static bool gShutdown = false;
++
++//TODO:
++//1. Implement shutdown of the application
++//2. Make number of clients configurable. Since wth SIPCC we can support atleast 8 Peer-connection
++// instances. Right now, only one client by name "Suhas" is started.
++//3. Ensure error checks throughout
++
++bool RTCApp::Init() {
++  cout << "Client: " << mId << " Init()" << endl;
++  nsresult rv;
++  mHttpAgent = new HttpClient();
++  MOZ_ASSERT(mHttpAgent);
++  cout << mId <<" Attempting to Initialize HttpAgent" << endl;
++  rv = mHttpAgent->Init();
++  if(NS_FAILED(rv)) {
++    cout << "Http Agent Initialization Failed " << endl;
++    return false;
++  }
++
++  nsIThread* thread;
++  rv = NS_NewThread(&thread);
++  if(NS_FAILED(rv)) {
++    cout << mId << " Failed to created PC Thread" << endl;
++    return false;
++  }
++  mThread = thread;
++
++  cout << mId <<" Attempting to Initialize SignalingAgent" << endl;
++  mSignalingAgent = new RTCClient();
++  MOZ_ASSERT(mSignalingAgent);
++  mSignalingAgent->Init(mThread);
++
++  //Let's register the client with our server
++  if(NS_FAILED(RegisterClientToServer(SERVER_ADDRESS))) {
++    cout << mId << "Login to the server failed " << endl;
++    return false;
++  }
++  //we are logged in now.
++  mInitDone = true;
++  return true;
++}
++
++nsresult RTCApp::RegisterClientToServer(std::string serv_address) {
++  nsresult rv;
++  std::string json = "{ \"assertion\" :\"";
++  json += mId.c_str();
++  json += "\"}";
++  HttpRequestInfo loginReq;
++  loginReq.requestMethod = "POST";
++  loginReq.requestUrl = serv_address+"/login";
++  loginReq.requestBody = (char*) malloc(json.length());
++  memcpy(loginReq.requestBody, json.c_str(), json.length());
++  loginReq.requestBody[json.length()]='\0';
++  cout << loginReq.requestBody << endl;
++  loginReq.bodyLength = json.length();
++  cout << loginReq.bodyLength  << endl;
++  rv = mHttpAgent->Init();
++  if(NS_FAILED(rv)) {
++    cerr << " HttpAgent Init Failed" << endl;
++    return rv;
++  }
++
++  rv = mHttpAgent->SendRequest(loginReq);
++  if(NS_FAILED(rv)) {
++    cerr << " HttpAgent SendRequest Failed" << endl;
++    return rv;
++  }
++
++  mHttpAgent->GetResponse();
++  return NS_OK;
++}
++
++
++/*
++  string eventName; //ex:userjoined, offer, answer
++  string eventSource; //who sent this event
++  string eventDest// to whom it was sent
++  string buffer;
++*/
++void RTCApp::HandlePeerData(rtc_client::EventData* evt) {
++  cout << "HandlePeerData() "  << endl;
++  cout << "Event " << evt->eventName << endl;
++  cout << "EventSource " << evt->eventSource << endl;
++  cout << "EventDest " << evt->eventDest << endl;
++  cout << "EventData " << evt->buffer << endl;
++  std::string event = evt->eventName;
++  //JSONify the string'ed SDP
++  sanitizeSdp(evt->buffer);
++  if(!event.compare("userjoined")) {
++      //just log for now
++  } else if (!event.compare("offer")) {
++    nsresult rv;
++    //send the offer to the remote end-point
++    uint32_t offerAnswerFlags = rtc_client::OFFER_AV | rtc_client::ANSWER_AV;
++    sipcc::MediaConstraints constraints;
++    mSignalingAgent->SetRemote(rtc_client::PCObserver::OFFER, evt->buffer);
++    mSignalingAgent->CreateAnswer(constraints, evt->buffer,offerAnswerFlags);
++    mSignalingAgent->SetLocal(rtc_client::PCObserver::ANSWER, mSignalingAgent->answer());
++    //send the answer to the peer
++    std::string answer = mSignalingAgent->answer();
++
++    //JSONify the sdp and our event reported to the server.
++    //This is done by hand to avoid dependency on external library
++    // and there is not much we need to do to have a library used here.
++    antiSantizeSdp(answer);
++    std::string json = "{\"to\":\"";
++    json += evt->eventSource;
++    json += "\", \"from\":\"" ;
++    json+= evt->eventDest;
++    json += "\", \"answer\": {\"type\":\"answer\",\"sdp\":\"";
++    json += answer;
++    json += "\"} }";
++
++    HttpRequestInfo req;
++    req.requestMethod = "POST";
++    req.requestUrl = "http://localhost:8000/answer";
++    req.requestBody = (char*) malloc(json.length());
++    memcpy(req.requestBody, json.c_str(), json.length());
++    req.requestBody[json.length()]='\0';
++    cout << req.requestBody << endl;
++    req.bodyLength = json.length();
++    cout << req.bodyLength  << endl;
++    rv = mHttpAgent->Init();
++    if(NS_FAILED(rv)) {
++      cerr << " HttpAgent Init Failed" << endl;
++      free(req.requestBody);
++      return;
++    }
++
++    rv = mHttpAgent->SendRequest(req);
++    if(NS_FAILED(rv)) {
++      cerr << " HttpAgent SendRequest Failed" << endl;
++      free(req.requestBody);
++      return;
++    }
++
++    //Not worrying about return value.
++    //TODO: Fix this
++    mHttpAgent->GetResponse();
++
++    ASSERT_TRUE_WAIT(mSignalingAgent->IceCompleted() == true, kDefaultTimeout);
++    cout <<" You should hear a tone now for 10 seconds" << endl;
++    PR_Sleep(kDefaultTimeout * 2); // Wait for some data to get written
++    mSignalingAgent->CloseSendStreams();
++    // Check that we wrote a bunch of data
++    cout << "Agent 2 Received " << mSignalingAgent->GetPacketsReceived(0) << " Audio packets " << endl;
++    free(req.requestBody);
++
++  } else if(!event.compare("answer")) {
++    //not handled for now
++    cout << "NOT HANDLED " << endl;
++  } else if(!event.compare("endSession")) {
++    cout << " NOT HANDLED " << endl;
++  } else {
++    cout << " NOT HANDLED" << endl;
++  }
++}
++
++//Quick fix to get rid of JSONification and Stringification
++void RTCApp::sanitizeSdp(std::string& sdp) {
++
++  if(!sdp.size())
++    return;
++
++  const char* nlcr  = "\\r\\n";
++  const char* nlcr_replace = "\r\n";
++  const char* quotes ="\"";
++  const char* quotes_replace ="";
++
++
++  size_t findLen = strlen(nlcr);
++  size_t replaceLen = strlen(nlcr_replace);
++  size_t pos = 0;
++
++   //search for the next occurrence of find within source
++  while ((pos = sdp.find( nlcr, pos)) != std::string::npos)
++  {
++    sdp.replace( pos, findLen, nlcr_replace );
++    pos += replaceLen;
++  }
++
++  //Temp logic. Move the both in a single loop than doing
++  //it seperately.
++  findLen = strlen(quotes);
++  replaceLen = strlen(quotes_replace);
++  pos = 0;
++  while ((pos = sdp.find( quotes, pos)) != std::string::npos)
++  {
++    sdp.replace( pos, findLen, quotes_replace );
++    pos += replaceLen;
++  }
++
++}
++
++//Quick fix for Stringification & Jsonification
++void RTCApp::antiSantizeSdp(std::string& sdp) {
++  if(!sdp.size())
++    return;
++
++  const char* nlcr  = "\r\n";
++  const char* nlcr_replace = "\\r\\n";
++
++  size_t findLen = strlen(nlcr);
++  size_t replaceLen = strlen(nlcr_replace);
++  size_t pos = 0;
++
++   //search for the next occurrence of find within source
++  while ((pos = sdp.find( nlcr, pos)) != std::string::npos)
++  {
++    sdp.replace( pos, findLen, nlcr_replace );
++    pos += replaceLen;
++  }
++}
++
++int main(int argc, char **argv) {
++  // This test can cause intermittent oranges on the builders
++  CHECK_ENVIRONMENT_FLAG("MOZ_WEBRTC_TESTS")
++  nsresult rv;
++  //This starts XPCOM Internally.
++  test_utils = new MtransportTestUtils();
++  NSS_NoDB_Init(NULL);
++  NSS_SetDomesticPolicy();
++
++  RTCApp theApp;
++  if(!theApp.Init())
++  {
++    cout <<"App Initialization Failed " << endl;
++    return 1;
++  }
++
++
++  //Event Source Loop
++  nsCOMPtr<nsIURI> evSrcUri;
++  nsCOMPtr<nsIHttpChannel> httpChannel;
++  nsCOMPtr<nsIChannel> channel;
++  rtc_client::EventSourceImpl* eveSource = new rtc_client::EventSourceImpl();
++  nsCOMPtr<nsIStreamListener> listener = eveSource;
++  eveSource->SetAppInstance(&theApp);
++  nsCOMPtr<nsIInterfaceRequestor> callbacks = new rtc_client::ChannelNotifications();
++
++  rv = NS_NewURI(getter_AddRefs(evSrcUri), "http://localhost:8000/events");
++  if(NS_FAILED(rv)) {
++    cerr << "Client Initialization Failed " << endl;
++    return 1;
++  }
++
++  rv = NS_NewChannel(getter_AddRefs(channel), evSrcUri, nullptr, nullptr, callbacks);
++  if(NS_FAILED(rv)) {
++    std::cerr << "Client Transport Channel creation failed " << std::endl;
++    return 1;
++  }
++
++  httpChannel = do_QueryInterface(channel);
++
++  rv = channel->AsyncOpen(listener, nullptr);
++  if(NS_FAILED(rv)) {
++    std::cerr << "Channel open Failed " << endl;
++    return 1;
++  }
++
++  cout << "Press ctrl-c to kill the application" << endl;
++  string option;
++  //wait for the events now
++  while(!gShutdown) {
++    NS_ProcessPendingEvents(nullptr);
++    PR_Sleep(PR_MillisecondsToInterval(500));
++  }
++
++  if(httpChannel) {
++    httpChannel->Cancel(NS_ERROR_ABORT);
++    httpChannel = nullptr;
++    channel = nullptr;
++  }
++
++  callbacks = nullptr;
++  eveSource = nullptr;
++
++  cout <<"Done running the application " << endl;
++  //Clean up the Environment
++  delete test_utils;
++  return 0;
++}
++
++#endif
+diff --git a/media/webrtc/signaling/test/ev_source_impl.h b/media/webrtc/signaling/test/ev_source_impl.h
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/ev_source_impl.h
+@@ -0,0 +1,288 @@
++#ifndef __EV_SOURCE_IMPL_H
++#define __EV_SOURCE_IMPL_H
++
++#include <iostream>
++#include <string>
++using namespace std;
++
++//XPCOM Includes
++#include "nspr.h"
++#include "nsCOMPtr.h"
++#include "nsNetCID.h"
++#include "nsIXPConnect.h"
++#include "nsIComponentManager.h"
++#include "nsIComponentRegistrar.h"
++#include "nsIIOService.h"
++#include "nsIServiceManager.h"
++#include "nsXPCOM.h"
++#include "nsIPrefBranch.h"
++#include "nsIInterfaceRequestor.h"
++#include "nsIInterfaceRequestorUtils.h"
++#include "nsIProgressEventSink.h"
++
++#include "rtc_app.h"
++
++//TODOs
++//1. Make this code talk to different client instances that could be started.
++// For now we just start only one client instance
++//2. Clean up some no-so-good string operation in OnDataAvailable.
++//3. Get rid of cerr/cout logging.
++//4. use RefPtr and Scoped versions instead of raw malloc/new
++namespace rtc_client {
++
++//This class represents a minimal implementation of
++// EventSource like Http Channel mechanism. Getting native
++// XPCOM client to work with Firefox's implementation failed
++// miserably due to JS context and Security dependencies. Hence
++// this "just works" version.
++class EventSourceImpl : public nsIStreamListener {
++public:
++  NS_DECL_ISUPPORTS
++  NS_DECL_NSIREQUESTOBSERVER
++  NS_DECL_NSISTREAMLISTENER
++
++  EventSourceImpl() { }
++  virtual ~EventSourceImpl() {}
++
++  void SetAppInstance(RTCApp* instance) {
++    mInstance = instance;
++  }
++private:
++  RTCApp* mInstance; //App to report the events to.
++};
++
++NS_IMPL_ISUPPORTS2(EventSourceImpl,
++                   nsIRequestObserver,
++                   nsIStreamListener)
++
++
++NS_IMETHODIMP
++EventSourceImpl::OnStartRequest(nsIRequest *req, nsISupports *ctxt)
++{
++  cout <<" On Start Request " << endl;
++  //eventInTransit = true;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++EventSourceImpl::OnStopRequest(nsIRequest *req,
++	                             nsISupports *ctxt,
++	                             nsresult status)
++{
++	cout << "OnStopRequest: Status "<< endl;
++  return NS_OK;
++}
++
++//TODO: Move parsing to higher layers
++//-------------------------------------------------
++// We check the events with the following format from our server
++// event:<event-name> [event:userjoined, event:offer]
++// length:<length> [length of the data component. Optional]
++// raw:<buffer> [points to sdp with no json multiple stringifications, optional]
++// data: to:<to>, from:<from> offer/answer:<sdp:>
++//-------------------------------------------------
++NS_IMETHODIMP
++EventSourceImpl::OnDataAvailable(nsIRequest *req,
++	                               nsISupports *ctxt,
++                                 nsIInputStream *stream,
++                                 uint64_t offset,
++                                 uint32_t count)
++{
++	cout << "OnDataAvailable: Count: " << count << endl;
++  char *buf = nullptr;
++  EventData*  evtData = nullptr;
++  nsresult rv;
++  uint32_t bytesRead = 0;
++
++  buf = (char*)malloc(count);
++  rv = stream->Read(buf,count,&bytesRead);
++  if(NS_FAILED(rv)) {
++    cerr << ">> Stream Read Failed " << endl;
++    free(buf);
++    return rv;
++  }
++
++  //Handle OK scenario
++  //Temp code, revisit this later
++  if(count < 3) {
++    //fwrite(buf, 1, bytesRead, stdout);
++    free(buf);
++    return NS_OK;
++  }
++
++  cerr << "Num Bytes Read " << bytesRead << endl;
++
++  std::string buffer(buf);
++  free(buf);
++
++  //parse event stream from the line buffer
++  //We are interested in followed fields
++  //Mandatory - event, length, data
++  //Optional  - raw (found only in offer/answer)
++
++  std::string event;
++  std::string data;
++  std::string rawSdp;
++  std::string dataLength;
++  std::string from;
++  std::string to;
++  size_t tmpPos = string::npos;
++  std::string tmpStr="";
++
++  size_t pos = buffer.find_first_of(":");
++  if(pos == string::npos) {
++    cerr <<" Invalid Data -1 - : Not found " << endl;
++    return NS_OK;
++  }
++
++  tmpStr = buffer.substr(0,pos);
++  if(tmpStr.compare("event") == 0) {
++    cerr<< "Found event " << endl;
++    tmpPos = buffer.find_first_of('\n',pos+1);
++    event = buffer.substr(pos+1, (tmpPos-pos-1));
++    cerr <<"event is " << event << endl;
++      //update pos
++    pos = tmpPos+1;
++  }
++
++  evtData = new EventData();
++  evtData->eventName = event;
++
++  //Parse Length Field
++  tmpPos = buffer.find_first_of(":",pos);
++  tmpStr = buffer.substr(pos,(tmpPos-pos));
++  if(tmpPos == string::npos ||
++  	      (tmpStr.compare("length")) ) {
++    cerr <<" Invalid lenght Field"<< endl;
++    return NS_OK;
++  }
++
++  pos = tmpPos;
++  cerr<<"Found Length " << endl;
++  tmpPos = buffer.find_first_of('\n',pos+1);
++  dataLength = buffer.substr(pos+1, (tmpPos-pos-1));
++  cerr <<"Length is " << dataLength << endl;
++  pos = tmpPos + 1;
++
++  bool didHandleRaw = false;
++  //Raw sdp is found only in the offer/answer events
++  if(!event.compare("offer") || !event.compare("answer")) {
++    //Extract Raw SDP
++    tmpPos = buffer.find_first_of(":",pos);
++    tmpStr = buffer.substr(pos,(tmpPos-pos));
++    if(tmpPos == string::npos ||
++  	      (tmpStr.compare("raw")) ) {
++      cerr <<" Invalid Raw/Data Field"<< endl;
++      return NS_OK;
++    }
++
++    cerr<<"Found Raw " << endl;
++    pos = buffer.find("sdp", tmpPos);
++    pos+=5;
++    tmpPos = buffer.find("data:",pos+1);
++    rawSdp = buffer.substr(pos, (tmpPos-pos-2));
++    cerr <<"Raw field is" << rawSdp << endl;
++    pos = tmpPos;
++    didHandleRaw = true;
++    evtData->buffer = rawSdp;
++  }
++
++  //extract data part of the event stream
++  tmpPos = buffer.find_first_of(":",pos);
++  tmpStr = buffer.substr(pos,(tmpPos-pos));
++  if(tmpPos == string::npos ||
++  	    (tmpStr.compare("data")) ) {
++    cerr <<" Invalid Data Field"<< endl;
++    return NS_OK;
++  }
++
++  pos = tmpPos;
++  cerr<<"Found Data field " << endl;
++  tmpPos = buffer.find_last_of('\n',pos+1);
++  data = buffer.substr(pos+1, (tmpPos-pos-1));
++  cerr << "Data field is" << data << endl;
++
++  if(didHandleRaw) {
++    //extract from, to
++    pos = 0;
++    tmpPos = string::npos;
++    tmpPos = data.find("from", pos);
++
++    //skip "from"
++    pos = tmpPos+7;
++    //get the from user name
++    tmpPos = data.find_first_of(",",pos);
++    from = data.substr(pos, tmpPos-pos-1);
++    cerr <<"From is " << from << endl;
++    evtData->eventSource = from;
++
++    pos = 0;
++    tmpPos = string::npos;
++    tmpPos = data.find("to", pos);
++
++    //skip "from"
++    pos = tmpPos+5;
++    //get the from user name
++    tmpPos = data.find_first_of(",",pos);
++    to = data.substr(pos, tmpPos-pos-1);
++    cerr <<"To is " << to << endl;
++    evtData->eventDest = to;
++  } else {
++  	evtData->buffer = data;
++  }
++
++  //Hand it off for processing
++  MOZ_ASSERT(mInstance);
++  mInstance->HandlePeerData(evtData);
++  delete(evtData);
++
++  return NS_OK;
++}
++
++
++//-----------------------------------------------------------------------------
++// NotificationCallbacks implementation
++//-----------------------------------------------------------------------------
++
++class ChannelNotifications : public nsIInterfaceRequestor
++                           , public nsIProgressEventSink
++{
++public:
++    NS_DECL_ISUPPORTS
++    NS_DECL_NSIINTERFACEREQUESTOR
++    NS_DECL_NSIPROGRESSEVENTSINK
++
++    ChannelNotifications() { }
++    virtual ~ChannelNotifications() {}
++};
++
++NS_IMPL_THREADSAFE_ISUPPORTS2(ChannelNotifications,
++                              nsIInterfaceRequestor,
++                              nsIProgressEventSink)
++
++NS_IMETHODIMP
++ChannelNotifications::GetInterface(const nsIID &iid, void **result)
++{
++    return QueryInterface(iid, result);
++}
++
++NS_IMETHODIMP
++ChannelNotifications::OnStatus(nsIRequest *req, nsISupports *ctx,
++                                nsresult status, const PRUnichar *statusText)
++{
++	cout << "OnStatus " << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++ChannelNotifications::OnProgress(nsIRequest *req, nsISupports *ctx,
++                            uint64_t progress, uint64_t progressMax)
++{
++    printf("progress: %llu/%llu\n", progress, progressMax);
++    return NS_OK;
++}
++
++
++}//namespace
++
++#endif
+diff --git a/media/webrtc/signaling/test/global_defines.h b/media/webrtc/signaling/test/global_defines.h
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/global_defines.h
+@@ -0,0 +1,27 @@
++#ifndef __GLOBALS_H
++#define __GLOBAS_H
++
++#include <string>
++using namespace std;
++
++namespace rtc_client {
++
++#define SERVER_ADDRESS "http://localhost:8000"
++#define SERVER_EVENT_SOURCE_ADDRESS "http://localhost:8000/events"
++#define MAX_RTC_CLIENTS 8
++
++//Handy way to pass the event for further
++//prcessing
++//Move this out of global data once we implement
++//proper event processing layer. This works for now !!
++typedef struct {
++  string eventName; //ex:userjoined, offer, answer
++  string eventSource; //who sent this event
++  string eventDest;// to whom it was sent
++  string buffer; // context specific buffer
++} EventData;
++
++
++} //end namespace
++
++#endif
+diff --git a/media/webrtc/signaling/test/http_client.h b/media/webrtc/signaling/test/http_client.h
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/http_client.h
+@@ -0,0 +1,95 @@
++#ifndef __HTTP_CLIENT__
++#define __HTTP_CLIENT__
++
++#include <iostream>
++#include <string>
++
++using namespace std;
++
++#include "nsIXPConnect.h"
++#include "nsIComponentManager.h"
++#include "nsIComponentRegistrar.h"
++#include "nsIIOService.h"
++#include "nsIServiceManager.h"
++#include "nsServiceManagerUtils.h"
++#include "TestHarness.h"
++#include "nsStringAPI.h"
++#include "nsIPrincipal.h"
++#include "nsIScriptSecurityManager.h"
++#include "nsIXMLHttpRequest.h"
++#include "nsNetUtil.h"
++#include "nsIUploadChannel.h"
++
++#include "nsIJSRuntimeService.h"
++#include "nsJSPrincipals.h"
++
++#include "nsThreadUtils.h"
++#include "nsXPCOM.h"
++#include "nss.h"
++
++namespace rtc_client {
++
++//Defines handle to hold the Http Request Data
++struct HttpRequestInfo {
++  HttpRequestInfo():requestMethod("GET") {
++                    }
++
++  ~HttpRequestInfo() {}
++  //Type of Request
++	std::string requestMethod;
++	//URL of the request
++	std::string requestUrl;
++  // Message to be sent
++  char* requestBody;
++  uint32_t bodyLength;
++};
++
++
++// Wrapper around XMLHttpRequest API and to hide nitty-gritties of
++// XPCOM setup.
++// This basic version serves only one request/response pair at a time.
++// Pipelining is not supported and only sync operation is allowed today.
++
++class HttpClient {
++public:
++  HttpClient(): mInitDone(false),
++                reqInProgress(false),
++                hasResponse(false)  {
++  }
++
++  nsresult Init();
++
++  ~HttpClient() {
++  	Close();
++  }
++
++  nsresult SendRequest(HttpRequestInfo& request);
++
++  std::string GetResponseBody() const {
++    //holds the last seen response only.
++    return responseBody;
++  }
++
++  nsresult GetResponse();
++
++  bool IsResponseAvailabe() const {
++    return hasResponse;
++  }
++
++private:
++  nsresult Close();
++
++  bool mInitDone;
++  bool reqInProgress; //future usage
++  bool hasResponse; // future usage
++  std::string responseBody; //future usage
++
++  //XPCOM Stuff goes here
++  nsCOMPtr<nsIXMLHttpRequest> xhr_; //our xmlhttp request service handle
++  nsCOMPtr<nsIScriptSecurityManager> secman_; //security context
++  nsCOMPtr<nsIPrincipal> systemPrincipal_;  //principal under which to run this request.
++};
++
++}//namespace
++
++#endif
+diff --git a/media/webrtc/signaling/test/http_client_impl.h b/media/webrtc/signaling/test/http_client_impl.h
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/http_client_impl.h
+@@ -0,0 +1,230 @@
++#include "http_client.h"
++#include "nsIVariant.h"
++#include "nsIStringStream.h"
++#include "nsStringStream.h"
++#include "nsError.h"
++
++//TODO:
++// Fix Error checks, Memory leaks once end-to-end media works.
++
++//static NS_DEFINE_CID(kIOServiceCID, NS_IOSERVICE_CID);
++
++namespace rtc_client {
++
++nsresult HttpClient::Init() {
++  nsresult rv;
++
++#if 0
++  //0. Verify XPCOM Init - NEEDED only for unittestting
++  //if(xpcom_.failed()) {
++   // std::cout << "XPCOM Initilization Failed !!" << endl;
++  	//return NS_ERROR_FAILURE;
++ // }
++ #endif
++
++  //XHR Handle
++  xhr_ = do_CreateInstance(NS_XMLHTTPREQUEST_CONTRACTID, &rv);
++  if(NS_FAILED(rv)) {
++  	std::cerr << " Couldn't create nsIXMLHttpRequest Instance !" << endl;
++  	return NS_ERROR_FAILURE;
++  }
++
++  //Script Security Manager Handle
++  secman_ = do_GetService(NS_SCRIPTSECURITYMANAGER_CONTRACTID, &rv);
++  if(NS_FAILED(rv)) {
++  	std::cerr << " Couldn't acquire script security manager service!" << endl;
++  	return NS_ERROR_FAILURE;
++  }
++
++  rv = secman_->GetSystemPrincipal(getter_AddRefs(systemPrincipal_));
++  if(NS_FAILED(rv)) {
++  	std::cerr << " Couldn't get System Principal " << endl;
++  	return NS_ERROR_FAILURE;
++  }
++
++  //Initialize XHR susbsytem
++  rv = xhr_->Init(systemPrincipal_, nullptr, nullptr, nullptr);
++  if(NS_FAILED(rv)) {
++  	std::cerr << " Couldn't Initialize XHR " << endl;
++  	return NS_ERROR_FAILURE;
++  }
++  //if we are here, we have something to work with
++  mInitDone = true;
++	return NS_OK;
++}
++
++nsresult HttpClient::Close() {
++  return NS_OK;
++}
++
++nsresult HttpClient::GetResponse() {
++  nsresult rv;
++  if(!mInitDone) {
++    cout << " HttpAgent is not initialized " << endl;
++    return NS_ERROR_FAILURE;
++  }
++
++  nsAutoString response;
++  rv = xhr_->GetResponseText(response);
++  reqInProgress = false;
++  if(NS_FAILED(rv)) {
++      cerr << "SendRequest: Getting Response Text Failed " << endl;
++      return NS_ERROR_FAILURE;
++  }
++
++  nsAutoCString responseUTF8 = NS_ConvertUTF16toUTF8(response);
++  responseBody = responseUTF8.get();
++  cout << "Response: "<< responseUTF8.get() << endl;
++  return NS_OK;
++}
++
++//Sync Operation as of now
++nsresult HttpClient::SendRequest(HttpRequestInfo& request) {
++  cout << "SendRequest:: Method:" <<request.requestMethod <<
++          " ,URL: " << request.requestUrl << endl;
++  MOZ_ASSERT(xhr_);
++  if(!mInitDone) {
++    cout << " HttpAgent is not initialized " << endl;
++    return NS_ERROR_FAILURE;
++  }
++  nsresult rv;
++  const nsAString& empty = EmptyString();
++  //Get URL off the request.
++  std::string method = request.requestMethod;
++  char* url = new char[request.requestUrl.size() + 1];
++  std::copy(request.requestUrl.begin(),
++            request.requestUrl.end(), url);
++  url[request.requestUrl.size()] = '\0';
++  nsAutoCString targetURL(url);
++  delete[] url;
++
++  if(method.compare("GET") == 0) {
++    NS_NAMED_LITERAL_CSTRING(getString, "GET");
++    rv = xhr_->Open(getString, targetURL, false, empty, empty);
++    if(NS_FAILED(rv)) {
++    	cerr << "SendRequest: Open() for GET failed " << endl;
++    	return NS_ERROR_FAILURE;
++    }
++
++    rv = xhr_->Send(nullptr);
++    if(NS_FAILED(rv)) {
++    	cerr << "SendRequest: Send Get Request Failed " << endl;
++      return NS_ERROR_FAILURE;
++    }
++
++    cout << "Done Sending Get Request" << endl;
++    //not used for now
++    reqInProgress = true;
++    //Get The response value.
++    nsAutoString response;
++    rv = xhr_->GetResponseText(response);
++    reqInProgress = false;
++    if(NS_FAILED(rv)) {
++    	cerr << "SendRequest: Getting Response Text Failed " << endl;
++    	return NS_ERROR_FAILURE;
++    }
++    nsAutoCString responseUTF8 = NS_ConvertUTF16toUTF8(response);
++    responseBody = responseUTF8.get();
++    cout << " Response: " << responseUTF8.get() << endl;
++    return NS_OK;
++
++  } else if(method.compare("POST") == 0) {
++    //Open the connection
++    NS_NAMED_LITERAL_CSTRING(postString, "POST");
++    rv = xhr_->Open(postString, targetURL, false, empty, empty);
++    if(NS_FAILED(rv)) {
++      cerr << "SendRequest: Open() for GET failed " << endl;
++      return NS_ERROR_FAILURE;
++    }
++#if 0
++    //nsCOMPtr<nsIIOService> ioService(do_GetService(kIOServiceCID, &rv));
++    //if(NS_FAILED(rv)) {
++    	//cerr << "SendRequest:POST: Unable to get IO Service" << endl;
++    	//return NS_ERROR_FAILURE;
++    //}
++
++    //NS_NAMED_LITERAL_STRING(uploadData,request.requestBody.c_str());
++#endif
++    //Create stream to upload POST data
++    nsCOMPtr<nsIStringInputStream> uploadStream =
++                                  do_CreateInstance(NS_STRINGINPUTSTREAM_CID);
++    cerr <<"Sending ..." << request.requestBody << " " << request.bodyLength << endl;
++    rv = uploadStream->SetData(request.requestBody,request.bodyLength);
++
++    if(NS_FAILED(rv)) {
++      cerr << "Unable to Allocate Byte Stream for REQ Body " << endl;
++      return NS_ERROR_FAILURE;
++    }
++
++    //Setup nsVariant
++    nsCOMPtr<nsIWritableVariant> variant = do_CreateInstance(NS_VARIANT_CONTRACTID);
++    rv = variant->SetAsISupports(uploadStream);
++    if(NS_FAILED(rv)) {
++      cerr << "Unable to Setup variant for REQ Body " << endl;
++      return NS_ERROR_FAILURE;
++    }
++
++    xhr_->SetRequestHeader(NS_LITERAL_CSTRING("Content-Type"), NS_LITERAL_CSTRING("application/json; charset=UTF-8"));
++    rv = xhr_->Send(variant);
++    if(NS_FAILED(rv)) {
++      cerr << "Sending Post Request Failed " << endl;
++      return NS_ERROR_FAILURE;
++    }
++#if 0
++    //get the underlying channel
++    //nsIChannel* xhrChannel;
++    //xhr_->GetChannel(&xhrChannel);
++    //cout <<" XHR Channel " << xhrChannel << endl;
++    //nsCOMPtr<nsIUploadChannel> uploadChannel = do_QueryInterface(xhrChannel);
++    //uploadChannel->SetUploadStream(uploadStream, EmptyCString(), -1);
++    //NS_NAMED_LITERAL_CSTRING(postString, "POST");
++#endif
++
++    cout << "Done Sending Post Request" << endl;
++    reqInProgress = true;
++    //Get The response value.
++    nsAutoString response;
++    rv = xhr_->GetResponseText(response);
++    reqInProgress = false;
++    if(NS_FAILED(rv)) {
++    	cerr << "SendRequest: Getting Response Text Failed " << endl;
++    	return NS_ERROR_FAILURE;
++    }
++    nsAutoCString responseUTF8 = NS_ConvertUTF16toUTF8(response);
++    responseBody = responseUTF8.get();
++    cout << "Response: "<< responseUTF8.get() << endl;
++    return NS_OK;
++  } else {
++    cerr <<" Invalid Request Mehtod" << endl;
++    return NS_ERROR_FAILURE;
++  }
++}
++
++}//namespace
++
++#if 0
++int main(int argc, char** argv) {
++  typedef rtc_client::HttpClient HttpClient;
++  typedef rtc_client::HttpRequestInfo HttpRequestInfo;
++  nsresult rv;
++  //Setup a dummy http request
++  HttpRequestInfo dummyReq;
++  dummyReq.requestMethod = "POST";
++  dummyReq.requestUrl = "http://localhost:4000";
++  dummyReq.requestBody = "This is a test body";
++  dummyReq.bodyLength = strlen(dummyReq.requestBody);
++  //Create our HTTP Client Instance
++  HttpClient httpAgent;
++  rv = httpAgent.Init();
++  if(NS_FAILED(rv)) {
++    cerr << " HttpAgent Init Failed" << endl;
++  }
++
++  rv = httpAgent.SendRequest(dummyReq);
++  if(NS_FAILED(rv)) {
++    cerr << " HttpAgent SendRequest Failed" << endl;
++  }
++  return 0;
++}
++#endif
++
+diff --git a/media/webrtc/signaling/test/rtc_app.h b/media/webrtc/signaling/test/rtc_app.h
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/rtc_app.h
+@@ -0,0 +1,48 @@
++#ifndef __RTC_APP_H
++#define __RTC_APP_H
++
++#include "global_defines.h"
++#include "rtc_client_impl.h"
++#include "http_client_impl.h"
++#include "nsThreadUtils.h"
++
++//Our Application - Move this code to a separate place later once
++// we implement multiple client instances as part fo the application.
++
++// A very basic RTC App.
++class RTCApp {
++
++public:
++  //handy typedef
++  typedef rtc_client::RTCClient RTCClient;
++  typedef rtc_client::HttpRequestInfo HttpRequestInfo;
++  typedef rtc_client::HttpClient HttpClient;
++
++  RTCApp(): mInitDone(false),
++            mSignalingAgent(nullptr),
++            mHttpAgent(nullptr),
++            mThread(nullptr),
++           mId("Suhas") {
++  }
++
++  ~RTCApp() {
++  }
++
++  bool Init();
++  nsresult RegisterClientToServer(std::string serv_address);
++  void HandlePeerData(rtc_client::EventData* evt);
++
++
++private:
++  //Brtute force JSON <-> Stringification Methods
++  // Improvise it later.
++  void sanitizeSdp(std::string& sdp);
++  void antiSantizeSdp(std::string& sdp);
++  bool mInitDone;
++  RTCClient* mSignalingAgent; //underlying peer-connection wrapper
++  HttpClient* mHttpAgent; //underlying HTTP Transaction wrapper
++  nsCOMPtr<nsIThread> mThread;
++  string mId;
++
++};
++#endif
+diff --git a/media/webrtc/signaling/test/rtc_client_impl.h b/media/webrtc/signaling/test/rtc_client_impl.h
+new file mode 100644
+--- /dev/null
++++ b/media/webrtc/signaling/test/rtc_client_impl.h
+@@ -0,0 +1,481 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include <iostream>
++#include <map>
++#include <algorithm>
++#include <string>
++
++using namespace std;
++#define GTEST_HAS_RTTI 0
++#include "gtest/gtest.h"
++#include "gtest_utils.h"
++
++#include "base/basictypes.h"
++
++#include "nspr.h"
++#include "nss.h"
++#include "ssl.h"
++#include "prthread.h"
++
++#include "FakeMediaStreams.h"
++#include "FakeMediaStreamsImpl.h"
++#include "PeerConnectionImpl.h"
++#include "runnable_utils.h"
++#include "nsStaticComponents.h"
++#include "nsIDOMRTCPeerConnection.h"
++
++#include "mtransport_test_utils.h"
++
++MtransportTestUtils *test_utils;
++
++static int kDefaultTimeout = 5000;
++
++/*
++ * A version of the RTC Client. This code is taken from SignalingUnitTests
++ * and simplied wherever needed.
++ */
++namespace rtc_client {
++
++enum offerAnswerFlags
++{
++  OFFER_NONE  = 0, // Sugar to make function calls clearer.
++  OFFER_AUDIO = (1<<0),
++  OFFER_VIDEO = (1<<1),
++  // Leaving some room here for other media types
++  ANSWER_NONE  = 0, // Sugar to make function calls clearer.
++  ANSWER_AUDIO = (1<<8),
++  ANSWER_VIDEO = (1<<9),
++
++  OFFER_AV = OFFER_AUDIO | OFFER_VIDEO,
++  ANSWER_AV = ANSWER_AUDIO | ANSWER_VIDEO
++};
++
++
++class PCObserver : public IPeerConnectionObserver
++{
++public:
++  enum Action {
++    OFFER,
++    ANSWER
++  };
++
++  enum StateType {
++    kReadyState,
++    kIceState,
++    kSdpState,
++    kSipccState
++  };
++
++  enum ResponseState {
++    stateNoResponse,
++    stateSuccess,
++    stateError
++  };
++
++  PCObserver(sipcc::PeerConnectionImpl *peerConnection) :
++    state(stateNoResponse),
++    onAddStreamCalled(false),
++    pc(peerConnection) {
++  }
++
++  virtual ~PCObserver() {}
++
++  std::vector<nsDOMMediaStream *> GetStreams() { return streams; }
++
++  NS_DECL_ISUPPORTS
++  NS_DECL_IPEERCONNECTIONOBSERVER
++
++  ResponseState state;
++  char *lastString;
++  uint32_t lastStatusCode;
++  uint32_t lastStateType;
++  bool onAddStreamCalled;
++
++private:
++  sipcc::PeerConnectionImpl *pc;
++  std::vector<nsDOMMediaStream *> streams;
++};
++
++NS_IMPL_THREADSAFE_ISUPPORTS1(PCObserver, IPeerConnectionObserver)
++
++NS_IMETHODIMP
++PCObserver::OnCreateOfferSuccess(const char* offer)
++{
++  lastString = strdup(offer);
++  state = stateSuccess;
++  cout << "onCreateOfferSuccess = " << offer << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnCreateOfferError(uint32_t code)
++{
++  lastStatusCode = code;
++  state = stateError;
++  cout << "onCreateOfferError" << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnCreateAnswerSuccess(const char* answer)
++{
++  lastString = strdup(answer);
++  state = stateSuccess;
++  cout << "onCreateAnswerSuccess = " << answer << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnCreateAnswerError(uint32_t code)
++{
++  lastStatusCode = code;
++  cout << "onCreateAnswerError = " << code << endl;
++  state = stateError;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnSetLocalDescriptionSuccess(uint32_t code)
++{
++  lastStatusCode = code;
++  state = stateSuccess;
++  cout << "onSetLocalDescriptionSuccess = " << code << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnSetRemoteDescriptionSuccess(uint32_t code)
++{
++  lastStatusCode = code;
++  state = stateSuccess;
++  cout << "onSetRemoteDescriptionSuccess = " << code << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnSetLocalDescriptionError(uint32_t code)
++{
++  lastStatusCode = code;
++  state = stateError;
++  cout << "onSetLocalDescriptionError = " << code << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnSetRemoteDescriptionError(uint32_t code)
++{
++  lastStatusCode = code;
++  state = stateError;
++  cout << "onSetRemoteDescriptionError = " << code << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::NotifyConnection()
++{
++  cout << "NotifyConection" << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::NotifyClosedConnection()
++{
++  cout << "NotifyClosedConection" << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::NotifyDataChannel(nsIDOMDataChannel *channel)
++{
++  cout << "NotifyDataChannel" << endl;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnStateChange(uint32_t state_type)
++{
++  nsresult rv;
++  uint32_t gotstate;
++
++  switch (state_type)
++  {
++  case kReadyState:
++    rv = pc->GetReadyState(&gotstate);
++    NS_ENSURE_SUCCESS(rv, rv);
++    cout << "Ready State: " << gotstate << endl;
++    break;
++  case kIceState:
++    rv = pc->GetIceState(&gotstate);
++    NS_ENSURE_SUCCESS(rv, rv);
++    cout << "ICE State: " << gotstate << endl;
++    break;
++  case kSdpState:
++    cout << "SDP State: " << endl;
++    // NS_ENSURE_SUCCESS(rv, rv);
++    break;
++  case kSipccState:
++    rv = pc->GetSipccState(&gotstate);
++    NS_ENSURE_SUCCESS(rv, rv);
++    cout << "SIPCC State: " << gotstate << endl;
++    break;
++  default:
++    // Unknown State
++    break;
++  }
++
++  state = stateSuccess;
++  lastStateType = state_type;
++  return NS_OK;
++}
++
++
++NS_IMETHODIMP
++PCObserver::OnAddStream(nsIDOMMediaStream *stream, const char *type)
++{
++  PR_ASSERT(stream);
++
++  nsDOMMediaStream *ms = static_cast<nsDOMMediaStream *>(stream);
++
++  cout << "OnAddStream called hints=" << ms->GetHintContents() << " type=" << type << " thread=" <<
++    PR_GetCurrentThread() << endl ;
++
++  onAddStreamCalled = true;
++
++  streams.push_back(ms);
++
++  // We know that the media stream is secretly a Fake_SourceMediaStream,
++  // so now we can start it pulling from us
++  Fake_SourceMediaStream *fs = static_cast<Fake_SourceMediaStream *>(ms->GetStream());
++
++  test_utils->sts_target()->Dispatch(
++    WrapRunnable(fs, &Fake_SourceMediaStream::Start),
++    NS_DISPATCH_NORMAL);
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnRemoveStream()
++{
++  state = stateSuccess;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnAddTrack()
++{
++  state = stateSuccess;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::OnRemoveTrack()
++{
++  state = stateSuccess;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PCObserver::FoundIceCandidate(const char* strCandidate)
++{
++  return NS_OK;
++}
++
++class RTCClient {
++ public:
++  RTCClient() : pc(nullptr) {}
++
++  ~RTCClient() {
++    pc->GetMainThread()->Dispatch(
++      WrapRunnable(this, &RTCClient::Close),
++      NS_DISPATCH_SYNC);
++  }
++
++  void Init(nsCOMPtr<nsIThread> thread)
++  {
++    size_t found = 2;
++    ASSERT_TRUE(found > 0);
++    pc = sipcc::PeerConnectionImpl::CreatePeerConnection();
++    ASSERT_TRUE(pc);
++
++    pObserver = new PCObserver(pc);
++    ASSERT_TRUE(pObserver);
++
++    ASSERT_EQ(pc->Initialize(pObserver, nullptr, thread), NS_OK);
++
++    ASSERT_TRUE_WAIT(sipcc_state() == sipcc::PeerConnectionImpl::kStarted,
++                     kDefaultTimeout);
++
++    ASSERT_TRUE_WAIT(ice_state() == sipcc::PeerConnectionImpl::kIceWaiting,
++                     5000);
++    cout << "Init Complete" << endl;
++  }
++
++  uint32_t sipcc_state()
++  {
++    uint32_t res;
++    pc->GetSipccState(&res);
++    return res;
++  }
++
++  uint32_t ice_state()
++  {
++    uint32_t res;
++    pc->GetIceState(&res);
++    return res;
++  }
++
++  void Close()
++  {
++    cout << "Close" << endl;
++    pc->Close(false);
++    pc = nullptr;
++ }
++
++  char* offer() const { return offer_; }
++  char* answer() const { return answer_; }
++
++  void CreateOffer(sipcc::MediaConstraints& constraints,
++                   uint32_t offerFlags) {
++
++    // Create a media stream as if it came from GUM
++    Fake_AudioStreamSource *audio_stream =
++      new Fake_AudioStreamSource();
++
++    nsresult ret;
++    test_utils->sts_target()->Dispatch(
++      WrapRunnableRet(audio_stream, &Fake_MediaStream::Start, &ret),
++        NS_DISPATCH_SYNC);
++
++    ASSERT_TRUE(NS_SUCCEEDED(ret));
++
++    // store in object to be used by RemoveStream
++    nsRefPtr<nsDOMMediaStream> domMediaStream = new nsDOMMediaStream(audio_stream);
++    domMediaStream_ = domMediaStream;
++
++    uint32_t aHintContents = 0;
++
++    if (offerFlags & OFFER_AUDIO) {
++      aHintContents |= nsDOMMediaStream::HINT_CONTENTS_AUDIO;
++    }
++    if (offerFlags & OFFER_VIDEO) {
++      aHintContents |= nsDOMMediaStream::HINT_CONTENTS_VIDEO;
++    }
++
++    domMediaStream->SetHintContents(aHintContents);
++
++    pc->AddStream(domMediaStream);
++    domMediaStream_ = domMediaStream;
++
++    // Now call CreateOffer as JS would
++    pObserver->state = PCObserver::stateNoResponse;
++    ASSERT_EQ(pc->CreateOffer(constraints), NS_OK);
++    ASSERT_TRUE_WAIT(pObserver->state == PCObserver::stateSuccess, kDefaultTimeout);
++    offer_ = pObserver->lastString;
++  }
++
++
++void CreateAnswer(sipcc::MediaConstraints& constraints, std::string offer,
++                    uint32_t offerAnswerFlags) {
++
++
++  // Create a media stream as if it came from GUM
++    Fake_AudioStreamSource *audio_stream =
++      new Fake_AudioStreamSource();
++
++    nsresult ret;
++    test_utils->sts_target()->Dispatch(
++      WrapRunnableRet(audio_stream, &Fake_MediaStream::Start, &ret),
++        NS_DISPATCH_SYNC);
++
++    ASSERT_TRUE(NS_SUCCEEDED(ret));
++
++    // store in object to be used by RemoveStream
++    nsRefPtr<nsDOMMediaStream> domMediaStream = new nsDOMMediaStream(audio_stream);
++    domMediaStream_ = domMediaStream;
++
++    // Create a media stream as if it came from GUM
++    //nsRefPtr<nsDOMMediaStream> domMediaStream = new nsDOMMediaStream();
++
++    uint32_t aHintContents = 0;
++
++    if (offerAnswerFlags & ANSWER_AUDIO) {
++      aHintContents |= nsDOMMediaStream::HINT_CONTENTS_AUDIO;
++    }
++    if (offerAnswerFlags & ANSWER_VIDEO) {
++      aHintContents |= nsDOMMediaStream::HINT_CONTENTS_VIDEO;
++    }
++
++    domMediaStream->SetHintContents(aHintContents);
++
++    pc->AddStream(domMediaStream);
++
++    pObserver->state = PCObserver::stateNoResponse;
++    ASSERT_EQ(pc->CreateAnswer(constraints), NS_OK);
++    ASSERT_TRUE_WAIT(pObserver->state == PCObserver::stateSuccess, kDefaultTimeout);
++    answer_ = pObserver->lastString;
++  }
++
++  void SetRemote(PCObserver::Action action, std::string remote) {
++    pObserver->state = PCObserver::stateNoResponse;
++    ASSERT_EQ(pc->SetRemoteDescription(action, remote.c_str()), NS_OK);
++    ASSERT_TRUE_WAIT(pObserver->state == PCObserver::stateSuccess, kDefaultTimeout);
++  }
++
++  void SetLocal(PCObserver::Action action, std::string local) {
++    pObserver->state = PCObserver::stateNoResponse;
++    ASSERT_EQ(pc->SetLocalDescription(action, local.c_str()), NS_OK);
++    ASSERT_TRUE_WAIT(pObserver->state == PCObserver::stateSuccess, kDefaultTimeout);
++  }
++
++  bool IceCompleted() {
++    uint32_t state;
++    pc->GetIceState(&state);
++    return state == sipcc::PeerConnectionImpl::kIceConnected;
++  }
++
++  int GetPacketsReceived(int stream) {
++    std::vector<nsDOMMediaStream *> streams = pObserver->GetStreams();
++
++    if ((int) streams.size() <= stream) {
++      return 0;
++    }
++
++    return streams[stream]->GetStream()->AsSourceStream()->GetSegmentsAdded();
++  }
++
++  int GetPacketsSent(int stream) {
++    return static_cast<Fake_MediaStreamBase *>(
++        domMediaStream_->GetStream())->GetSegmentsAdded();
++  }
++
++  //Stops generating new audio data for transmission.
++  //Should be called before Cleanup of the peer connection.
++  void CloseSendStreams() {
++    static_cast<Fake_AudioStreamSource*>(
++        domMediaStream_->GetStream())->StopStream();
++  }
++
++  //Stops pulling audio data off the receivers.
++  //Should be called before Cleanup of the peer connection.
++  void CloseReceiveStreams() {
++    std::vector<nsDOMMediaStream *> streams =
++                            pObserver->GetStreams();
++    for(int i=0; i < streams.size(); i++) {
++      streams[i]->GetStream()->AsSourceStream()->StopStream();
++    }
++  }
++
++public:
++  mozilla::RefPtr<sipcc::PeerConnectionImpl> pc;
++  nsRefPtr<PCObserver> pObserver;
++  char* offer_;
++  char* answer_;
++  nsRefPtr<nsDOMMediaStream> domMediaStream_;
++};
++
++} // End namespace
++
++
