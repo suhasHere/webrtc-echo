@@ -72,7 +72,7 @@ app.get("/events", function(req, res) {
     var dataLen = usrStr.length;
     res.write("event:userjoined\n");
     res.write("length:"+user.length+"\n");
-    res.write(usrStr);
+    res.write(usrStr+"\n");
     res.write("\n\n");
   }
 
@@ -96,11 +96,11 @@ app.post("/offer", function(req, res) {
     res.send(400, "Invalid user for offer");
     return;
   }
-  var sdpStr = JSON.stringify(req.body);
+  var bodyStr = JSON.stringify(req.body);
   channel.write("event:offer\n");
-  channel.write("length:"+sdpStr.length+"\n");
+  //channel.write("length:"+bodyStr.length+"\n");
   channel.write("raw:"+req.body.offer+"\n");
-  channel.write("data:" + sdpStr);
+  channel.write("data:" + bodyStr);
   channel.write("\n\n");
 
   res.send(200);
@@ -188,8 +188,10 @@ app.post("/endSession", function(req,res) {
     return;
   }
 
-  channel.write("event: endSession\n");
-  channel.write("data: " + JSON.stringify(req.body));
+  var bodyStr = JSON.stringify(req.body);
+  channel.write("event:endSession\n");
+  channel.write("length:"+bodyStr.length+"\n");
+  channel.write("data:" + JSON.stringify(req.body));
   channel.write("\n\n");
 
   res.send(200);
@@ -220,7 +222,10 @@ function notifyAllAbout(user) {
   for (var i = 0; i < keys.length; i++) {
     var channel = users[keys[i]];
     channel.write("event:userjoined\n");
-    channel.write("data: " + user + "\n\n");
+    channel.write("length:"+user.length+"\n");
+    channel.write("data:" + user + "\n");
+    channel.write("\n\n");
+
   }
 }
 
